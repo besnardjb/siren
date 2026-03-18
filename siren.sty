@@ -1,0 +1,294 @@
+% ============================================================================
+% SIren: Mermaid Integration for LaTeX via Rust
+% ============================================================================
+% MIT License
+%
+% Copyright (c) 2026
+%
+% Permission is hereby granted, free of charge, to any person obtaining a copy
+% of this software and associated documentation files (the "Software"), to deal
+% in the Software without restriction, including without limitation the rights
+% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+% copies of the Software, and to permit persons to whom the Software is
+% furnished to do so, subject to the following conditions:
+%
+% The above copyright notice and this permission notice shall be included in all
+% copies or substantial portions of the Software.
+%
+% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+% SOFTWARE.
+% ============================================================================
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{siren}[2026/03/18 SIren Mermaid Integration for Rust - MIT Licensed]
+
+% ============================================================================
+% REQUIRED PACKAGES
+% ============================================================================
+% fancyvrb: Provides VerbatimOut/VerbatimInput for handling raw text
+% xparse: Modern interface definition for document environments
+% shellesc: Enables shell command execution from LaTeX
+% graphicx: Required for \includegraphics to embed PDF output
+% xcolor: Provides color support for error messaging
+% pdftexcmds: Offers engine-compatible MD5 hashing functionality
+\RequirePackage{fancyvrb}
+\RequirePackage{xparse}
+\RequirePackage{shellesc}
+\RequirePackage{graphicx}
+\RequirePackage{xcolor}
+\RequirePackage{pdftexcmds}
+
+% ============================================================================
+% INTERNAL STATE VARIABLES
+% ============================================================================
+\newcounter{siren@diagram}
+
+% ============================================================================
+% HELPER MACROS
+% ============================================================================
+
+% Check if a command exists in PATH
+% Usage: \siren@checkbinary{command_name}
+% Returns 1 if found, 0 otherwise
+% Cross-platform compatible check using `type` (Windows), `which` (Unix)
+\newcommand\siren@checkbinary[1]{%
+	\IfFileExists{\jobname-\string#1-check}{%
+		% Reuse cached result
+		\input{\jobname-\string#1-check}%
+	}{%
+		% Perform fresh check and cache result
+		\immediate\write18{%
+			if command -v #1 > /dev/null 2>&1; then echo 1; else echo 0; fi
+		}%
+		\immediate\write18{%
+			echo \the\pdfoutput > \jobname-\string#1-check%
+		}%
+		\input{\jobname-\string#1-check}%
+	}%
+}
+
+% Execute a shell command with timeout and error capture
+% Usage: \siren@shell{command}
+% Returns error status in \siren@shellstatus (0 = success, non-zero = failure)
+% Logs output to a temporary file for debugging
+\newcommand\siren@shell[1]{%
+	\edef\siren@shelltmp{siren_shell_\thesiren@diagram.tmp}%
+	\edef\siren@shellstatus{1}%
+	\immediate\write18{%
+		timeout 60 bash -c "#1" > "\siren@shelltmp" 2>&1\relax
+	}%
+	\ifnum\the\pdflastcmdstatus=0\relax
+		\edef\siren@shellstatus{0}%
+	\fi
+	% Store output for debugging if needed
+	\ifnum\siren@shellstatus=1\relax
+		\typeout{SIren Shell Error: Command failed, see \siren@shelltmp}%
+	\fi
+}
+
+% ============================================================================
+% THE CORE MERMAID ENVIRONMENT
+% ============================================================================
+% Usage: \begin{mermaid}[width=0.8\textwidth] ... \end{mermaid}
+%
+% Features:
+% - Automatic .mmd file generation from environment content
+% - MD5-based caching to skip re-rendering when unchanged
+% - Toolchain execution: selkie (MMD→SVG) → rsvg-convert (SVG→PDF)
+% - Comprehensive error reporting with toolchain logs
+% - Automatic cleanup of stale artifacts before re-rendering
+\NewDocumentEnvironment{mermaid}{O{}}
+{%
+	\stepcounter{siren@diagram}%
+	% Define unique file paths for this diagram instance
+	\def\siren@mmd{siren_out_\thesiren@diagram.mmd}%
+	\def\siren@svg{siren_out_\thesiren@diagram.svg}%
+	\def\siren@pdf{siren_out_\thesiren@diagram.pdf}%
+	\def\siren@log{siren_out_\thesiren@diagram.log}%
+	\def\siren@md5{siren_out_\thesiren@diagram.md5}%
+
+	% Write the environment contents to the .mmd file
+	\VerbatimOut{\siren@mmd}%
+}{%
+	\endVerbatimOut
+
+	% ======================================================================
+	% PHASE 1: Validate Toolchain Availability
+	% ======================================================================
+	% Check that required binaries exist before attempting any processing
+	% Write results to temp files, then read them properly
+	\immediate\write18{if command -v selkie >/dev/null 2>&1; then printf '1'; else printf '0'; fi > siren_selkie_check.txt}
+	\immediate\write18{if command -v rsvg-convert >/dev/null 2>&1; then printf '1'; else printf '0'; fi > siren_rsvg_check.txt}
+	% Read the single-line files using standard \read
+	\newread\siren@checkread
+	\openin\siren@checkread=siren_selkie_check.txt
+	\read\siren@checkread to \siren@selkieexists
+	\closein\siren@checkread
+	\openin\siren@checkread=siren_rsvg_check.txt
+	\read\siren@checkread to \siren@rsvgexists
+	\closein\siren@checkread
+	\ifnum\siren@selkieexists=0\relax
+		\PackageError{siren}%
+		{selkie binary not found in PATH}%
+		{Please install selkie via "cargo install selkie" and ensure it is in your PATH.}%
+	\fi
+	\ifnum\siren@rsvgexists=0\relax
+		\PackageError{siren}%
+		{rsvg-convert binary not found in PATH}%
+		{Please install librsvg (rsvg-convert) and ensure it is in your PATH.}%
+		{macOS: brew install librsvg\\
+			Linux: sudo apt install librsvg2-bin}%
+	\fi
+
+	% ======================================================================
+	% PHASE 2: Robust MD5 Check for Caching
+	% ======================================================================
+	% Compute current MD5 hash of the .mmd file
+	% Use \csname pdf@filemd5\endcsname for engine compatibility (pdfTeX, XeTeX, LuaTeX)
+	\edef\siren@currentmd5{\expandafter\csname pdf@filemd5\endcsname{\siren@mmd}}%
+
+	% Initialize flag to run toolchain (default: yes)
+	\edef\siren@runtoolchain{1}%
+
+	% Check if cache file exists and compare hashes
+	\IfFileExists{\siren@md5}{%
+		\newread\siren@tempread
+		\openin\siren@tempread=\siren@md5
+		\read\siren@tempread to \siren@oldmd5
+		\closein\siren@tempread
+		% If hashes match exactly, skip the heavy lifting
+		\ifx\siren@currentmd5\siren@oldmd5
+			\edef\siren@runtoolchain{0}%
+			\typeout{SIren: Diagram \thesiren@diagram unchanged (using cached output).}%
+		\else
+			\typeout{SIren: Diagram \thesiren@diagram changed (MD5 mismatch), re-rendering...}%
+		\fi
+	}{%
+		\typeout{SIren: No cache found for diagram \thesiren@diagram, rendering from scratch.}%
+	}
+
+	% ======================================================================
+	% PHASE 3: Execute Toolchain (Only if Cache Miss or No Cache)
+	% ======================================================================
+	\ifnum\siren@runtoolchain=1\relax
+		\typeout{SIren: Rendering diagram \thesiren@diagram...}%
+
+		% Execute toolchain with comprehensive error handling:
+		% 1. Delete old artifacts to prevent stale data
+		% 2. Run selkie to convert .mmd to .svg (capture all output to log)
+		% 3. Run rsvg-convert to convert .svg to .pdf (append to same log)
+		% 4. Save current MD5 hash for future cache validation
+		%
+		% Note: Using 'rm -f' to silently ignore missing files
+		% Using '&&' to ensure sequential execution (stops on first failure)
+		% Redirecting both stdout and stderr (2>&1) to capture all diagnostics
+
+		\edef\siren@toolcmd{%
+			rm -f "\siren@pdf" "\siren@svg" && %
+			selkie "\siren@mmd" -o "\siren@svg" > "\siren@log" 2>&1 && %
+			rsvg-convert -f pdf -o "\siren@pdf" "\siren@svg" >> "\siren@log" 2>&1 && %
+			echo "\siren@currentmd5" > "\siren@md5"%
+		}%
+
+		% Execute with timeout (60 seconds) to prevent hanging
+		\immediate\write18{timeout 60 bash -c "\siren@toolcmd" 2>&1}%
+
+		% Check if the PDF was successfully generated
+		\IfFileExists{\siren@pdf}{}{%
+			\typeout{SIren: Warning: selkie/rsvg-convert failed, check \siren@log for details.}%
+		}
+	\fi
+
+	% ======================================================================
+	% PHASE 4: Inclusion Logic
+	% ======================================================================
+	\IfFileExists{\siren@pdf}{%
+		% Success: Include the generated PDF in the document
+		\includegraphics[#1]{\siren@pdf}%
+	}{%
+		% Failure: Display detailed error report
+		\color{red!85!black}
+		\setlength{\fboxsep}{10pt}
+		\fbox{%
+			\begin{minipage}{0.9\textwidth}
+				\raggedright\small\ttfamily
+				% Header
+				\textbf{⚠️ SIren Toolchain Failure [Diagram \thesiren@diagram]}\\
+				\rule{\linewidth}{0.4pt}\\[2mm]
+
+				% Error details
+				\IfFileExists{\siren@log}{%
+					\textbf{Toolchain Output:}\\
+					\VerbatimInput{\siren@log}%
+				}{%
+					\textbf{No log found.}\\[1mm]
+					Common causes:\\
+					\begin{itemize}
+						\item \texttt{--shell-escape} flag not enabled during compilation
+						\item \texttt{selkie} or \texttt{rsvg-convert} not in PATH
+						\item Insufficient file permissions in working directory
+					\end{itemize}%
+				}%
+
+				% Trace information
+				\vspace{3mm}\\
+				\textbf{Trace:}\\
+				Input: \texttt{\siren@mmd} \\
+				Expected: \texttt{\siren@pdf} \\
+				Status: \textbf{FAILED}%
+			\end{minipage}%
+		}%
+	}
+}
+
+% ============================================================================
+% USAGE EXAMPLES
+% ============================================================================
+% The mermaid environment now behaves like \includegraphics - no automatic
+% centering or wrapping. Wrap it yourself as needed:
+%
+% Basic usage (no wrapper):
+% \begin{mermaid}[width=0.7\textwidth]
+%   sequenceDiagram
+%   participant U as User
+%   U->>API: Request
+% \end{mermaid}
+%
+% With figure float and caption:
+% \begin{figure}[ht]
+%   \centering
+%   \begin{mermaid}[width=0.7\textwidth]
+%     sequenceDiagram
+%     participant U as User
+%     U->>API: Request
+%   \end{mermaid}
+%   \caption{System flow}
+%   \label{fig:system}
+% \end{figure}
+%
+% With custom alignment:
+% \begin{flushleft}
+% \begin{mermaid}[width=0.5\textwidth]
+%   graph LR
+%   A-->B
+% \end{mermaid}
+% \end{flushleft}
+
+% ============================================================================
+% CLEANUP MACRO (Optional)
+% ============================================================================
+% Call this at the end of your document to clean up temporary files
+% Usage: \siren@cleanup
+\newcommand\siren@cleanup{%
+	\immediate\write18{%
+		rm -f siren_out_*.mmd siren_out_*.svg siren_out_*.log siren_out_*.md5 \\
+		siren_selkie_check.txt siren_rsvg_check.txt siren_shell_*.tmp 2>/dev/null
+	}%
+}
+
+\endinput
